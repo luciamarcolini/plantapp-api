@@ -1,0 +1,6 @@
+@PlantAPI_HostAddress = http://localhost:5251
+
+POST {{PlantAPI_HostAddress}}/weatherforecast/uploadFromCamera
+Accept: application/json
+
+###

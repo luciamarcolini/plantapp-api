@@ -1,0 +1,11 @@
+@PlantAppAPI_HostAddress = http://localhost:5024
+
+GET {{PlantAppAPI_HostAddress}}/todos/
+Accept: application/json
+
+###
+
+GET {{PlantAppAPI_HostAddress}}/todos/1
+Accept: application/json
+
+###
