@@ -8,6 +8,7 @@ namespace PlantAPI.Models
         public string model { get; set; }
         public List<object> messages { get; set; }
         public int max_tokens { get; set; }
+        public object response_format { set; get; }
 
         public class Content
         {

@@ -5,6 +5,12 @@ using PlantAPI.Models;
 using System.Net.Http.Headers;
 using Azure.Storage.Blobs;
 using Microsoft.Extensions.Configuration;
+using System.Text;
+using OpenAI;
+using Microsoft.EntityFrameworkCore;
+using static System.Net.Mime.MediaTypeNames;
+using System;
+using PlantAPI.Data;
 
 namespace PlantAPI.Controllers
 {
@@ -16,7 +22,8 @@ namespace PlantAPI.Controllers
         private readonly string? containerName;
         private readonly string? endpointAzureStorage;
         private readonly string? baseUrlOpenAI;
-        public PlantController(IConfiguration configuration)
+        private IDbService _dbService;
+        public PlantController(IConfiguration configuration, IDbService dbService)
         {
             _configuration = configuration;
             openAiApiKey = _configuration["openAiApiKey"];
@@ -24,95 +31,155 @@ namespace PlantAPI.Controllers
             containerName = _configuration["blobService_container"];
             endpointAzureStorage = _configuration["azureStorage_endpoint"];
             baseUrlOpenAI = _configuration["baseUrlOpenAI"];
+            _dbService = dbService;
         }
 
         [HttpPost, Route("uploadFromCamera")]
-        public async Task<IActionResult> Post(IFormFile image, bool dev = false)
+        public async Task<IActionResult> Post(IFormFile image, string deviceId, bool dev = false)
         {
             if (image == null || image.Length == 0)
             {
                 return BadRequest("No file uploaded.");
             }
 
-            var path = Path.Combine("C://Temp//", string.Concat(Guid.NewGuid() + "_", image.FileName)); //guardo la imagen
+            var fileName = $"{Guid.NewGuid()}_{image.FileName}";
+            var path = Path.Combine("C://Temp//", fileName);
 
-            using (var stream = new FileStream(path, FileMode.Create))
+            try
             {
-               await image.CopyToAsync(stream);
-            }
+                await using (var stream = new FileStream(path, FileMode.Create))
+                {
+                    await image.CopyToAsync(stream);
+                }
 
-
-            if (dev)
-            {
-                return Ok(await GetDiseasePredictionTest(path));
-            }
-            else
-            {
                 var url = await UploadImageToBlobStorage(path);
-                return Ok(await GetDiseasePrediction(path, url));
-            }
 
+                if (dev)
+                {
+                    return Ok(await GetDiseasePredictionTest(path, url, deviceId));
+                }
+                else
+                {
+
+                    return Ok(await GetDiseasePrediction(path, url, deviceId));
+                }
+            }
+            catch
+            {
+                return StatusCode(500, "An error occurred while processing the image.");
+            }
         }
 
-        public async Task<OpenAIResponse> GetDiseasePrediction(string pathImage, string url)
+        public async Task<Desease> GetDiseasePrediction(string pathImage, string url, string deviceId)
         {
-            var client = new HttpClient();
-            var messages = new List<object>();
+            using var client = new HttpClient();
 
-            var contentList = new List<object>();
-            var content1 = new { type = "text", text = "Dada la siguiente planta, identificar enfermedades potenciales" };
-            var content2 = new { type = "image_url", image_url = new OpenAIRequest.ImageUrl() { url = url } };
-            contentList.Add(content1);
-            contentList.Add(content2);
-            messages.Add(new { role = "user", content = contentList });
+            var messages = new List<object>
+            {
+                new { role = "user", content = new List<object>
+                    {
+                        //new { type = "text", text = "Base on this image, detect desease and give the information in a valid json with this format in spanish:\r\n\r\n{\r\n   \"isDesease\": true,\r\n   \"scientific_name\":\"plant cientific denomination\"\r\n   \"description\": \"small description of the plant\",\r\n   \"deseases\": [ up to two deseases ordered by highest probability\r\n      \"deseaseName\": \"desease plant cientific denomination\",\r\n      \"deseaseDescription\":\"small description of desease\",\r\n      \"solution\": \"fertilizer or another solution description\"\r\n     ]\r\n}\r\n" },
+                    new { type = "text", text = "Base on this image, detect desease and give the information in a valid json that must strictly adhere to this format. Give the information in spanish:\r\n\r\n{\r\n   \"isDesease\": \"type boolean, true if ill or false if not\",\r\n   \"scientific_name\":\"type string, cientific name denomination of plant\"\r\n   \"description\": \"small description of the plant, information about his leaves,trunk, perennial or not, description technical\",\r\n   \"deseases\": [ the most probability desease (one) if ordered by highest probability, if not ill send all element below in null\r\n      \"deseaseName\": \"type string, desease plant cientific name denomination\",\r\n      \"deseaseDescription\":\"type string, small description of desease, like what produce this desease\",\r\n      \"solution\": \"type string, small description of solution to desease\",\r\n      \"fertilizer\":\"type string, fertilizer brands witch can be buyed in Argentina, up to 3, indicate the name of the product and company that manufactures the product, separated by comma. For example, for oidio desease give me some responses like Cantus from BASF\"\r\n     ]\r\n}"},    
+                    new { type = "image_url", image_url = new OpenAIRequest.ImageUrl() { url = url } }
+                    }
+                }
+            };
 
             var model = new OpenAIRequest()
             {
                 model = "gpt-4o-mini",
                 messages = messages,
-                max_tokens = 200
+                response_format = new { type = "json_object" },
+                max_tokens = 500
             };
 
-            var request = new HttpRequestMessage(HttpMethod.Post, baseUrlOpenAI);
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer",  openAiApiKey);
-            client.DefaultRequestHeaders.Add("User-Agent", "C# App");
-            var content = new StringContent(JsonConvert.SerializeObject(model), null, "application/json");
-            request.Content = content;
+            var request = new HttpRequestMessage(HttpMethod.Post, baseUrlOpenAI)
+            {
+                Content = new StringContent(JsonConvert.SerializeObject(model), Encoding.UTF8, "application/json")
+            };
+
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", openAiApiKey);
+
             var response = await client.SendAsync(request);
-            //response.EnsureSuccessStatusCode();
-            var modelresult = JsonConvert.DeserializeObject<OpenAIResponse>(response.Content.ReadAsStringAsync().Result);
-            return modelresult;
+
+            response.EnsureSuccessStatusCode();
+
+            var responseContent = await response.Content.ReadAsStringAsync();
+            var modelResult = JsonConvert.DeserializeObject<OpenAIResponse>(responseContent);
+            var cont = JsonConvert.DeserializeObject<Desease>(modelResult.choices[0].Message.Content);
+
+            await SaveResultCapture(url, deviceId, cont);
+
+            return cont;
         }
 
-        public async Task<OpenAIResponse> GetDiseasePredictionTest(string pathImage)
+        public async Task<bool> SaveResultCapture(string pathImage, string deviceId, Desease model)
         {
-            var choice = new Choice()
+            Capture capture = new Capture()
             {
-                Index = 0,
-                Message = new PlantAPI.Models.Message()
-                {
-                    Role = "assistant",
-                    Content = "En la planta de uva que muestras, las características visibles sugieren varias enfermedades potenciales:\n\n1. **Mildew polvoriento (Oidium)**: La presencia de un manto blanco en las hojas puede indicar esta enfermedad fúngica. Se manifiesta como un polvo blanquecino que afecta el crecimiento de la planta.\n\n2. **Punto de hoja (Cercospora)**: Las manchas marrones o rojizas en las hojas pueden ser un signo de esta enfermedad. Puede llevar a la caída prematura de las hojas.\n\n"
-                },
-                LogProbs = null,
-                FinishReason = "length"
+                deviceId = deviceId,
+                urlImage = pathImage,
+                deseasesResult = JsonConvert.SerializeObject(model.deseases),
+                scientific_name = model.scientific_name,
+                description = model.description,
+                Id = Guid.NewGuid().ToString(),
+                isDesease = model.isDesease
             };
 
-            List<Choice> listaChoices = [choice];
+            var result = await _dbService.AddCapture(capture);
 
-            return new OpenAIResponse()
+            return true;
+        }
+
+        public async Task<Desease> GetDiseasePredictionTest(string pathImage, string url, string deviceId)
+        {
+            //return new OpenAIResponse()
+            //{
+            //    id = "chatcmpl-9nH9can1G1aFpldPnWfqRocbYbc1B",
+            //    created = 1721531040,
+            //    model = "gpt-4o-mini-2024-07-18",
+            //    choices = listaChoices,
+            //    usage = new PlantAPI.Models.Usage()
+            //    {
+            //        PromptTokens = 25516,
+            //        CompletionTokens = 200,
+            //        TotalTokens = 2571
+            //    }
+            //};
+
+            var enfermedad1 = new DeseaseDetails()
             {
-                id = "chatcmpl-9nH9can1G1aFpldPnWfqRocbYbc1B",
-                created = 1721531040,
-                model = "gpt-4o-mini-2024-07-18",
-                choices = listaChoices,
-                usage = new Usage()
-                {
-                    PromptTokens = 25516,
-                    CompletionTokens = 200,
-                    TotalTokens = 2571
-                }
+                deseaseName = "Oidio",
+                deseaseScientificName = "Erysiphe necator",
+                deseaseDescription = "El oidio es un hongo que afecta las hojas y los frutos, cubriéndolos con un polvo blanco o gris.",
+                solution = "Aplicar fungicidas específicos como azufre en polvo o productos a base de cobre.",
+                fertilizer = "Azufre en polvo o fungicidas a base de cobre"
             };
+            var enfermedad2 = new DeseaseDetails()
+            {
+                deseaseName = "Mildiu",
+                deseaseScientificName = "Plasmopara viticola",
+                deseaseDescription = "El mildiu es un hongo que provoca manchas aceitosas en las hojas y moho en los frutos.",
+                solution = "Usar fungicidas a base de cobre y asegurar una buena ventilación del viñedo.",
+                fertilizer = "Fungicidas cúpricos."
+            };
+            var enfer = new List<DeseaseDetails>
+            {
+                enfermedad1,
+                enfermedad2
+            };
+
+            var model = new Desease()
+            {
+                isDesease = true,
+                scientific_name = "Vitis vinifera",
+                description = "La vid es una planta leñosa trepadora, cultivada principalmente por sus frutos, las uvas, que se utilizan para producir vino, jugo, y otras bebidas.",
+                deseases = enfer
+            };
+
+            await SaveResultCapture(url, deviceId, model);
+
+            return model;
         }
 
         public async Task<string> UploadImageToBlobStorage(string imagePath)
@@ -120,21 +187,20 @@ namespace PlantAPI.Controllers
             BlobServiceClient blobServiceClient = new BlobServiceClient(connectionString);
             BlobContainerClient containerClient = blobServiceClient.GetBlobContainerClient(containerName);
 
-            //// Create the container if it doesn't exist
             await containerClient.CreateIfNotExistsAsync();
-
-            // Get a reference to a blob
             string blobName = Path.GetFileName(imagePath);
+
             BlobClient blobClient = containerClient.GetBlobClient(blobName);
-
-            Console.WriteLine($"Uploading to Blob storage as blob:\n\t {blobClient.Uri}");
-
-            // Open the file and upload its data
             using FileStream uploadFileStream = System.IO.File.OpenRead(imagePath);
             await blobClient.UploadAsync(uploadFileStream, true);
             uploadFileStream.Close();
             return blobClient.Uri.AbsoluteUri;
-          
+        }
+
+        [HttpGet, Route("captures")]
+        public async Task<IActionResult> GetCaptures(string deviceId)
+        {
+            return Ok(new { capture = await _dbService.GetCapturesByDeviceId(deviceId) });
         }
     }
 }
